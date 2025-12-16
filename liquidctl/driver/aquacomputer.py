@@ -85,8 +85,13 @@ def put_unaligned_be16(value, data, offset):
     data[offset], data[offset + 1] = value_be[0], value_be[1]
 
 
+def u16le_from(data, offset):
+    return int(data[offset]) | (int(data[offset + 1]) << 8)
+
+
 class Aquacomputer(UsbHidDriver):
     _DEVICE_D5NEXT = "D5 Next"
+    _DEVICE_D5LEGACY = "D5 Legacy"
     _DEVICE_FARBWERK360 = "Farbwerk 360"
     _DEVICE_OCTO = "Octo"
     _DEVICE_QUADRO = "Quadro"
@@ -109,6 +114,31 @@ class Aquacomputer(UsbHidDriver):
             "ctrl_report_length": 0x329,
             "fan_ctrl": {"pump": 0x96, "fan": 0x41},
             "hwmon_ctrl_mapping": {"pump": "pwm1", "fan": "pwm2"},
+        },
+        _DEVICE_D5LEGACY: {
+            "type": _DEVICE_D5LEGACY,
+            "status_read_method": "feature",
+            # This device exposes only feature reports (no interrupt IN/out).
+            # HID descriptor indicates report ID 0x02 has 0x32 bytes and report
+            # ID 0x03 has 0x75 bytes (including report ID in the returned buffer
+            # for this platform/hidapi).
+            "status_report_id": 0x02,
+            # On Windows/hidapi, the buffer passed to get_feature_report must
+            # include space for the report ID byte; requesting exactly 0x32
+            # bytes results in a read error.
+            "status_report_length": 0x33,
+            # Pump RPM is a 16-bit little-endian value at offsets 0x29..0x2a
+            # in the full report buffer (including the report ID byte).
+            "pump_rpm_offset": 0x29,
+            "ctrl_report_id": 0x03,
+            # Same buffer sizing quirk as above: request 0x75+1 bytes.
+            "ctrl_report_length": 0x76,
+            # Duty setpoint is a 16-bit little-endian value at offsets
+            # 0x05..0x06 (including the report ID byte).
+            "ctrl_setpoint_offset": 0x05,
+            "min_duty": 25,
+            "max_duty": 100,
+            "raw_duty_max": 0x7F,
         },
         _DEVICE_FARBWERK360: {
             "type": _DEVICE_FARBWERK360,
@@ -172,6 +202,12 @@ class Aquacomputer(UsbHidDriver):
         ),
         (
             0x0C70,
+            0xF003,
+            "Aquacomputer D5 Legacy",
+            {"device_info": _DEVICE_INFO[_DEVICE_D5LEGACY]},
+        ),
+        (
+            0x0C70,
             0xF010,
             "Aquacomputer Farbwerk 360",
             {"device_info": _DEVICE_INFO[_DEVICE_FARBWERK360]},
@@ -217,6 +253,10 @@ class Aquacomputer(UsbHidDriver):
         return [("Firmware version", fw, ""), ("Serial number", serial_number, "")]
 
     def _get_status_directly(self):
+        if self._device_info["type"] == self._DEVICE_D5LEGACY:
+            msg = self._read()
+            return [("Pump speed", u16le_from(msg, self._device_info["pump_rpm_offset"]), "rpm")]
+
         def _read_temp_sensors(offsets_key, labels_key):
             for idx, temp_sensor_offset in enumerate(self._device_info.get(offsets_key, [])):
                 temp_sensor_value = u16be_from(msg, temp_sensor_offset)
@@ -393,6 +433,11 @@ class Aquacomputer(UsbHidDriver):
         Returns a list of `(property, value, unit)` tuples.
         """
 
+        if self._device_info["type"] == self._DEVICE_D5LEGACY:
+            # The legacy D5 uses different HID reports and is not supported by the
+            # in-kernel aquacomputer_d5next hwmon driver.
+            return self._get_status_directly()
+
         if self._hwmon and not direct_access:
             _LOGGER.info("bound to %s kernel driver, reading status from hwmon", self._hwmon.driver)
             return self._get_status_from_hwmon()
@@ -469,9 +514,49 @@ class Aquacomputer(UsbHidDriver):
 
         self.device.send_feature_report(ctrl_settings)
 
+    def _set_fixed_speed_d5legacy(self, duty):
+        min_duty = self._device_info["min_duty"]
+        max_duty = self._device_info["max_duty"]
+        if duty < min_duty:
+            raise ValueError(
+                f"duty must be in range [{min_duty}, {max_duty}] for Aquacomputer D5 Legacy"
+            )
+        if duty > max_duty:
+            raise ValueError(
+                f"duty must be in range [{min_duty}, {max_duty}] for Aquacomputer D5 Legacy"
+            )
+
+        # Aquasuite maps 25..100% to 0..0x7f.
+        raw_max = self._device_info["raw_duty_max"]
+        span = max_duty - min_duty
+        raw = ((duty - min_duty) * raw_max + span // 2) // span
+        raw = clamp(raw, 0, raw_max)
+
+        # Request an up to date ctrl report (feature report 0x03)
+        report_length = self._device_info["ctrl_report_length"]
+        ctrl_settings = self.device.get_feature_report(self._device_info["ctrl_report_id"], report_length)
+        if ctrl_settings is None:
+            raise OSError("failed to read control report")
+
+        offset = self._device_info["ctrl_setpoint_offset"]
+        ctrl_settings[offset] = raw
+        ctrl_settings[offset + 1] = 0x00
+
+        time.sleep(0.2)
+        try:
+            self.device.send_feature_report(ctrl_settings)
+        except OSError:
+            # Fallback for backends that only support output reports.
+            self.device.write(ctrl_settings)
+
     def set_fixed_speed(self, channel, duty, direct_access=False, **kwargs):
         if self._device_info["type"] == self._DEVICE_FARBWERK360:
             raise NotSupportedByDevice()
+
+        if self._device_info["type"] == self._DEVICE_D5LEGACY:
+            if channel != "pump":
+                raise NotSupportedByDevice()
+            return self._set_fixed_speed_d5legacy(duty)
 
         # Clamp duty between 0 and 100
         duty = clamp(duty, 0, 100)
@@ -528,7 +613,11 @@ class Aquacomputer(UsbHidDriver):
         return self._serial
 
     def _read(self, clear_first=True):
-        if clear_first:
-            self.device.clear_enqueued_reports()
-        msg = self.device.read(self._device_info["status_report_length"])
+        if self._device_info.get("status_read_method") == "feature":
+            report_id = self._device_info["status_report_id"]
+            msg = self.device.get_feature_report(report_id, self._device_info["status_report_length"])
+        else:
+            if clear_first:
+                self.device.clear_enqueued_reports()
+            msg = self.device.read(self._device_info["status_report_length"])
         return msg

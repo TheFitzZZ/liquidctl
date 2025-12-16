@@ -161,6 +161,20 @@ QUADRO_SAMPLE_CONTROL_REPORT = bytes.fromhex(
     "FFF03FFFFFF00FAFFFF01CE10FF0100E0A8"
 )
 
+D5LEGACY_SAMPLE_STATUS_REPORT2_PAYLOAD = bytes.fromhex(
+    # HID feature report 0x02 payload (report id byte stripped).
+    # Full report begins with: 02 04 00 f4 03 e9 03 4c ...
+    "0400f403e9034c04784fb97657a76fdcdf03fd03ff03df0310ffee0200000000"
+    "ff7f0000000000002007ff7fff7f000000"
+)
+
+D5LEGACY_SAMPLE_CONTROL_REPORT3_PAYLOAD = bytes.fromhex(
+    # HID feature report 0x03 payload (report id byte stripped).
+    # This is a real-looking header captured from the device; the rest is padded.
+    "04000c03000002000010ff01000054070a2002e8038813"
+    + "00" * (116 - 24)
+)
+
 
 @pytest.fixture
 def mockD5NextDevice():
@@ -991,3 +1005,61 @@ def test_quadro_set_fixed_speeds_hwmon(mockQuadroDevice, has_support, tmp_path):
 def test_quadro_speed_profiles_not_supported(mockQuadroDevice):
     with pytest.raises(NotSupportedByDriver):
         mockQuadroDevice.set_speed_profile("fan", None)
+
+
+@pytest.fixture
+def mockD5LegacyDevice():
+    device = _MockD5LegacyDevice()
+    dev = Aquacomputer(
+        device,
+        "Mock Aquacomputer D5 Legacy",
+        device_info=Aquacomputer._DEVICE_INFO[Aquacomputer._DEVICE_D5LEGACY],
+    )
+
+    dev.connect()
+    return dev
+
+
+class _MockD5LegacyDevice(MockHidapiDevice):
+    def __init__(self):
+        super().__init__(vendor_id=0x0C70, product_id=0xF003)
+
+        # Status is fetched via get_feature_report(0x02)
+        self.preload_read(Report(0x02, D5LEGACY_SAMPLE_STATUS_REPORT2_PAYLOAD))
+        self.preload_read(Report(0x02, D5LEGACY_SAMPLE_STATUS_REPORT2_PAYLOAD))
+        # Control report is fetched via get_feature_report(0x03)
+        self.preload_read(Report(0x03, D5LEGACY_SAMPLE_CONTROL_REPORT3_PAYLOAD))
+
+
+def test_d5legacy_get_status(mockD5LegacyDevice):
+    got = mockD5LegacyDevice.get_status()
+    assert got == [("Pump speed", 1824, "rpm")]
+
+
+@pytest.mark.parametrize(
+    "duty,expected_raw",
+    [
+        (30, 0x08),
+        (60, 0x3B),
+        (80, 0x5D),
+        (100, 0x7F),
+    ],
+)
+def test_d5legacy_set_fixed_speed_generates_expected_report(mockD5LegacyDevice, duty, expected_raw):
+    mockD5LegacyDevice.set_fixed_speed("pump", duty)
+
+    report = mockD5LegacyDevice.device.sent[-1]
+    assert report.number == 0x03
+    # Duty setpoint is at offsets 0x05..0x06 in the full report buffer (including report ID);
+    # MockHidapiDevice stores payload without the report ID byte, so subtract 1.
+    assert report.data[0x04:0x06] == [expected_raw, 0x00]
+
+
+def test_d5legacy_set_fixed_speed_rejects_below_25(mockD5LegacyDevice):
+    with pytest.raises(ValueError):
+        mockD5LegacyDevice.set_fixed_speed("pump", 24)
+
+
+def test_d5legacy_set_fixed_speed_only_supports_pump_channel(mockD5LegacyDevice):
+    with pytest.raises(NotSupportedByDevice):
+        mockD5LegacyDevice.set_fixed_speed("fan", 50)
